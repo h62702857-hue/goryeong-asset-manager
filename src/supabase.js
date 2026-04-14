@@ -1,7 +1,13 @@
 import { createClient } from '@supabase/supabase-js';
 
-const url = import.meta.env.VITE_SUPABASE_URL;
-const key = import.meta.env.VITE_SUPABASE_ANON_KEY;
+// 기본값: 고령군청소년문화의집 전용 Supabase 프로젝트
+// publishable 키는 브라우저 노출을 전제로 발급되는 공개 키이므로 하드코딩해도 안전합니다.
+// 실제 보안은 Supabase RLS 정책이 담당합니다.
+const DEFAULT_URL = 'https://eziuuewblrkwtycdkjcm.supabase.co';
+const DEFAULT_KEY = 'sb_publishable_YMEPD1us-d2vhwcEA6cNYg_qE8GVxtj';
+
+const url = import.meta.env.VITE_SUPABASE_URL || DEFAULT_URL;
+const key = import.meta.env.VITE_SUPABASE_ANON_KEY || DEFAULT_KEY;
 
 export const isSupabaseConfigured = Boolean(url && key);
 
