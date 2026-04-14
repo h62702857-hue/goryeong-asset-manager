@@ -348,34 +348,106 @@ export default function App() {
     }, '수리 기록 삭제 실패');
   };
 
-  // 엑셀 내보내기
-  const handleExport = () => {
+  // 엑셀 내보내기 (사진을 이미지로 삽입)
+  const handleExport = async () => {
     if (items.length === 0) {
       alert('내보낼 데이터가 없습니다.');
       return;
     }
-    const data = items.map((item, idx) => ({
-      번호: idx + 1,
-      물품명: item.name,
-      분류: item.category,
-      수량: item.quantity,
-      상태: item.status,
-      위치: item.location,
-      비고: item.note,
-      사진: item.photo_url ? '있음' : '-',
-      수리기록수: (item.repairs || []).length,
-      등록일: item.created_at ? item.created_at.split('T')[0] : '-',
-    }));
-    const ws = XLSX.utils.json_to_sheet(data);
-    ws['!cols'] = [
-      { wch: 6 }, { wch: 20 }, { wch: 12 }, { wch: 6 },
-      { wch: 10 }, { wch: 15 }, { wch: 20 }, { wch: 8 },
-      { wch: 10 }, { wch: 12 },
-    ];
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, '물품기기');
-    const today = new Date().toISOString().split('T')[0];
-    XLSX.writeFile(wb, `고령군청소년문화의집_물품기기_${today}.xlsx`);
+    await runSafely(async () => {
+      // ExcelJS를 동적 로드 (초기 번들 크기 절약)
+      const ExcelJS = (await import('exceljs')).default;
+      const workbook = new ExcelJS.Workbook();
+      const worksheet = workbook.addWorksheet('물품기기');
+
+      worksheet.columns = [
+        { header: '번호', key: 'no', width: 6 },
+        { header: '사진', key: 'photo', width: 15 },
+        { header: '물품명', key: 'name', width: 20 },
+        { header: '분류', key: 'category', width: 12 },
+        { header: '수량', key: 'quantity', width: 6 },
+        { header: '상태', key: 'status', width: 10 },
+        { header: '위치', key: 'location', width: 15 },
+        { header: '비고', key: 'note', width: 25 },
+        { header: '수리기록수', key: 'repairs', width: 10 },
+        { header: '등록일', key: 'created', width: 12 },
+      ];
+
+      const headerRow = worksheet.getRow(1);
+      headerRow.font = { bold: true, size: 11 };
+      headerRow.alignment = { vertical: 'middle', horizontal: 'center' };
+      headerRow.height = 24;
+
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        const rowNum = i + 2;
+
+        const row = worksheet.addRow({
+          no: i + 1,
+          photo: '',
+          name: item.name,
+          category: item.category,
+          quantity: item.quantity,
+          status: item.status,
+          location: item.location,
+          note: item.note,
+          repairs: (item.repairs || []).length,
+          created: item.created_at ? item.created_at.split('T')[0] : '-',
+        });
+        row.alignment = { vertical: 'middle' };
+
+        if (item.photo_url) {
+          try {
+            // Supabase Storage에서 직접 다운로드 (CORS 우회)
+            let buffer;
+            const marker = '/photos/';
+            const idx = item.photo_url.indexOf(marker);
+            if (idx !== -1) {
+              const path = item.photo_url.slice(idx + marker.length);
+              const { data, error: dlErr } = await supabase.storage
+                .from('photos')
+                .download(path);
+              if (dlErr) throw dlErr;
+              buffer = await data.arrayBuffer();
+            } else {
+              const response = await fetch(item.photo_url);
+              buffer = await response.arrayBuffer();
+            }
+
+            const imageId = workbook.addImage({
+              buffer,
+              extension: 'jpeg',
+            });
+            worksheet.addImage(imageId, {
+              tl: { col: 1.1, row: rowNum - 1 + 0.1 },
+              ext: { width: 90, height: 90 },
+              editAs: 'oneCell',
+            });
+            worksheet.getRow(rowNum).height = 75;
+          } catch (err) {
+            console.warn('이미지 로드 실패:', item.name, err);
+            worksheet.getCell(`B${rowNum}`).value = '(사진 로드 실패)';
+          }
+        } else {
+          worksheet.getRow(rowNum).height = 22;
+          worksheet.getCell(`B${rowNum}`).value = '-';
+        }
+      }
+
+      // 파일 다운로드
+      const buf = await workbook.xlsx.writeBuffer();
+      const blob = new Blob([buf], {
+        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `고령군청소년문화의집_물품기기_${new Date().toISOString().split('T')[0]}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }, '엑셀 내보내기 실패');
   };
 
   // 엑셀 불러오기 (bulk insert)
