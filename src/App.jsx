@@ -1,8 +1,13 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import * as XLSX from 'xlsx';
+import {
+  supabase,
+  isSupabaseConfigured,
+  uploadPhotoIfNeeded,
+  deletePhotoFromStorage,
+} from './supabase.js';
 import './App.css';
 
-const STORAGE_KEY = 'goryeong-assets-v1';
 const MAX_IMAGE_WIDTH = 1024;
 const IMAGE_QUALITY = 0.7;
 
@@ -21,16 +26,16 @@ const emptyForm = {
   status: '사용가능',
   location: '',
   note: '',
-  photo: null,
+  photo_url: null,
 };
 
 const makeEmptyRepair = () => ({
   date: new Date().toISOString().split('T')[0],
   description: '',
-  photo: null,
+  photo_url: null,
 });
 
-// 이미지 용량을 줄이기 위해 캔버스로 리사이즈 + JPEG 압축
+// 이미지 리사이즈 + JPEG 압축 (data URL 반환)
 async function compressImage(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -57,6 +62,49 @@ async function compressImage(file) {
   });
 }
 
+function SetupScreen() {
+  return (
+    <div className="app">
+      <header className="header">
+        <h1>고령군청소년문화의집</h1>
+        <p>물품기기 관리 시스템</p>
+      </header>
+      <section className="card">
+        <h2>⚙️ Supabase 설정이 필요합니다</h2>
+        <p>
+          아직 데이터베이스가 연결되지 않았어요. 아래 환경 변수를 설정하면 앱이 동작합니다.
+        </p>
+        <pre
+          style={{
+            background: '#f7fafc',
+            padding: 16,
+            borderRadius: 8,
+            overflow: 'auto',
+            fontSize: 13,
+          }}
+        >
+{`VITE_SUPABASE_URL=https://your-project.supabase.co
+VITE_SUPABASE_ANON_KEY=your-anon-public-key`}
+        </pre>
+        <ul>
+          <li>
+            <strong>로컬 개발</strong>: 프로젝트 루트에 <code>.env.local</code> 파일을 만들고 위 값을
+            넣은 뒤 <code>npm run dev</code>
+          </li>
+          <li>
+            <strong>Cloudflare Pages</strong>: 프로젝트 설정 →{' '}
+            <em>Environment variables</em> 에 두 값 추가 후 재배포
+          </li>
+          <li>
+            <strong>테이블 생성</strong>: Supabase → SQL Editor 에서{' '}
+            <code>supabase-schema.sql</code> 파일 내용을 실행
+          </li>
+        </ul>
+      </section>
+    </div>
+  );
+}
+
 export default function App() {
   const [items, setItems] = useState([]);
   const [form, setForm] = useState(emptyForm);
@@ -67,28 +115,76 @@ export default function App() {
   const [repairModalItem, setRepairModalItem] = useState(null);
   const [repairForm, setRepairForm] = useState(makeEmptyRepair());
   const [photoPreview, setPhotoPreview] = useState(null);
-  const [loaded, setLoaded] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
 
-  // localStorage에서 데이터 불러오기
-  useEffect(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) setItems(JSON.parse(saved));
-    } catch (e) {
-      console.error('데이터 로딩 실패', e);
+  const fetchItems = useCallback(async () => {
+    if (!supabase) return;
+    const { data, error } = await supabase
+      .from('items')
+      .select('*, repairs(*)')
+      .order('created_at', { ascending: true });
+    if (error) {
+      setError('데이터를 불러오지 못했습니다: ' + error.message);
+      return;
     }
-    setLoaded(true);
+    const sorted = (data || []).map((item) => ({
+      ...item,
+      repairs: (item.repairs || []).sort(
+        (a, b) => new Date(a.created_at) - new Date(b.created_at)
+      ),
+    }));
+    setItems(sorted);
+    setRepairModalItem((prev) =>
+      prev ? sorted.find((i) => i.id === prev.id) || null : null
+    );
   }, []);
 
-  // 데이터가 바뀌면 자동 저장
+  // 초기 로딩 + 실시간 구독
   useEffect(() => {
-    if (!loaded) return;
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
-    } catch (e) {
-      alert('저장 공간이 부족합니다. 사진 용량이 너무 큽니다.');
+    if (!isSupabaseConfigured) {
+      setLoading(false);
+      return;
     }
-  }, [items, loaded]);
+    (async () => {
+      setLoading(true);
+      await fetchItems();
+      setLoading(false);
+    })();
+
+    const channel = supabase
+      .channel('realtime-items')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'items' },
+        () => fetchItems()
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'repairs' },
+        () => fetchItems()
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [fetchItems]);
+
+  const runSafely = async (fn, errorMsg) => {
+    setBusy(true);
+    setError(null);
+    try {
+      return await fn();
+    } catch (err) {
+      console.error(err);
+      setError(errorMsg ? `${errorMsg}: ${err.message || err}` : err.message || String(err));
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const handleFormChange = (e) => {
     const { name, value } = e.target;
@@ -101,9 +197,9 @@ export default function App() {
     try {
       const compressed = await compressImage(file);
       if (target === 'form') {
-        setForm((prev) => ({ ...prev, photo: compressed }));
+        setForm((prev) => ({ ...prev, photo_url: compressed }));
       } else if (target === 'repair') {
-        setRepairForm((prev) => ({ ...prev, photo: compressed }));
+        setRepairForm((prev) => ({ ...prev, photo_url: compressed }));
       }
     } catch (err) {
       alert('사진을 불러오지 못했습니다.');
@@ -112,55 +208,88 @@ export default function App() {
   };
 
   const removePhoto = (target) => {
-    if (target === 'form') setForm((prev) => ({ ...prev, photo: null }));
-    else if (target === 'repair') setRepairForm((prev) => ({ ...prev, photo: null }));
+    if (target === 'form') setForm((prev) => ({ ...prev, photo_url: null }));
+    else if (target === 'repair') setRepairForm((prev) => ({ ...prev, photo_url: null }));
   };
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
     if (!form.name.trim()) {
       alert('물품명을 입력해주세요.');
       return;
     }
-    if (editingId !== null) {
-      setItems((prev) =>
-        prev.map((item) =>
-          item.id === editingId
-            ? { ...item, ...form, quantity: Number(form.quantity) || 0 }
-            : item
-        )
-      );
-      setEditingId(null);
-    } else {
-      const newItem = {
-        id: Date.now(),
-        ...form,
+
+    await runSafely(async () => {
+      // 기존 사진 URL (편집 중인 경우)
+      const existingItem = editingId
+        ? items.find((i) => i.id === editingId)
+        : null;
+      const oldPhotoUrl = existingItem?.photo_url || null;
+
+      // 사진이 새로 바뀌었으면 업로드
+      const photoUrl = await uploadPhotoIfNeeded(form.photo_url);
+
+      const payload = {
+        name: form.name.trim(),
+        category: form.category || '',
         quantity: Number(form.quantity) || 0,
-        repairs: [],
-        createdAt: new Date().toISOString(),
+        status: form.status,
+        location: form.location || '',
+        note: form.note || '',
+        photo_url: photoUrl,
+        updated_at: new Date().toISOString(),
       };
-      setItems((prev) => [...prev, newItem]);
-    }
-    setForm(emptyForm);
+
+      if (editingId) {
+        const { error } = await supabase
+          .from('items')
+          .update(payload)
+          .eq('id', editingId);
+        if (error) throw error;
+
+        // 기존 사진이 교체되었다면 Storage에서 삭제
+        if (oldPhotoUrl && oldPhotoUrl !== photoUrl) {
+          await deletePhotoFromStorage(oldPhotoUrl);
+        }
+      } else {
+        const { error } = await supabase.from('items').insert(payload);
+        if (error) throw error;
+      }
+
+      setForm(emptyForm);
+      setEditingId(null);
+      await fetchItems();
+    }, '저장 실패');
   };
 
   const handleEdit = (item) => {
     setForm({
-      name: item.name,
-      category: item.category,
-      quantity: item.quantity,
-      status: item.status,
-      location: item.location,
-      note: item.note,
-      photo: item.photo || null,
+      name: item.name || '',
+      category: item.category || '',
+      quantity: item.quantity ?? 1,
+      status: item.status || '사용가능',
+      location: item.location || '',
+      note: item.note || '',
+      photo_url: item.photo_url || null,
     });
     setEditingId(item.id);
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
-  const handleDelete = (id) => {
+  const handleDelete = async (id) => {
     if (!confirm('정말 삭제하시겠습니까? 수리 기록도 함께 삭제됩니다.')) return;
-    setItems((prev) => prev.filter((item) => item.id !== id));
+    const target = items.find((i) => i.id === id);
+    await runSafely(async () => {
+      const { error } = await supabase.from('items').delete().eq('id', id);
+      if (error) throw error;
+
+      // 관련 사진들 Storage에서 삭제 (실패해도 무시)
+      if (target?.photo_url) await deletePhotoFromStorage(target.photo_url);
+      for (const r of target?.repairs || []) {
+        if (r.photo_url) await deletePhotoFromStorage(r.photo_url);
+      }
+      await fetchItems();
+    }, '삭제 실패');
   };
 
   const handleCancel = () => {
@@ -179,58 +308,47 @@ export default function App() {
     setRepairForm(makeEmptyRepair());
   };
 
-  const addRepair = (e) => {
+  const addRepair = async (e) => {
     e.preventDefault();
     if (!repairForm.description.trim()) {
       alert('수리 내용을 입력해주세요.');
       return;
     }
-    const newRepair = {
-      id: Date.now(),
-      date: repairForm.date,
-      description: repairForm.description,
-      photo: repairForm.photo,
-    };
-    setItems((prev) =>
-      prev.map((item) =>
-        item.id === repairModalItem.id
-          ? {
-              ...item,
-              repairs: [...(item.repairs || []), newRepair],
-              status: '수리중',
-            }
-          : item
-      )
-    );
-    setRepairModalItem((prev) =>
-      prev
-        ? {
-            ...prev,
-            repairs: [...(prev.repairs || []), newRepair],
-            status: '수리중',
-          }
-        : prev
-    );
-    setRepairForm(makeEmptyRepair());
+    await runSafely(async () => {
+      const photoUrl = await uploadPhotoIfNeeded(repairForm.photo_url);
+      const payload = {
+        item_id: repairModalItem.id,
+        date: repairForm.date || new Date().toISOString().split('T')[0],
+        description: repairForm.description.trim(),
+        photo_url: photoUrl,
+      };
+      const { error: repairErr } = await supabase.from('repairs').insert(payload);
+      if (repairErr) throw repairErr;
+
+      // 상태를 수리중으로 자동 변경
+      const { error: updateErr } = await supabase
+        .from('items')
+        .update({ status: '수리중', updated_at: new Date().toISOString() })
+        .eq('id', repairModalItem.id);
+      if (updateErr) throw updateErr;
+
+      setRepairForm(makeEmptyRepair());
+      await fetchItems();
+    }, '수리 기록 추가 실패');
   };
 
-  const deleteRepair = (repairId) => {
+  const deleteRepair = async (repairId) => {
     if (!confirm('이 수리 기록을 삭제하시겠습니까?')) return;
-    setItems((prev) =>
-      prev.map((item) =>
-        item.id === repairModalItem.id
-          ? { ...item, repairs: (item.repairs || []).filter((r) => r.id !== repairId) }
-          : item
-      )
-    );
-    setRepairModalItem((prev) =>
-      prev
-        ? { ...prev, repairs: (prev.repairs || []).filter((r) => r.id !== repairId) }
-        : prev
-    );
+    const target = (repairModalItem.repairs || []).find((r) => r.id === repairId);
+    await runSafely(async () => {
+      const { error } = await supabase.from('repairs').delete().eq('id', repairId);
+      if (error) throw error;
+      if (target?.photo_url) await deletePhotoFromStorage(target.photo_url);
+      await fetchItems();
+    }, '수리 기록 삭제 실패');
   };
 
-  // 엑셀 내보내기 (SheetJS)
+  // 엑셀 내보내기
   const handleExport = () => {
     if (items.length === 0) {
       alert('내보낼 데이터가 없습니다.');
@@ -244,9 +362,9 @@ export default function App() {
       상태: item.status,
       위치: item.location,
       비고: item.note,
-      사진: item.photo ? '있음' : '-',
+      사진: item.photo_url ? '있음' : '-',
       수리기록수: (item.repairs || []).length,
-      등록일: item.createdAt ? item.createdAt.split('T')[0] : '-',
+      등록일: item.created_at ? item.created_at.split('T')[0] : '-',
     }));
     const ws = XLSX.utils.json_to_sheet(data);
     ws['!cols'] = [
@@ -260,41 +378,58 @@ export default function App() {
     XLSX.writeFile(wb, `고령군청소년문화의집_물품기기_${today}.xlsx`);
   };
 
-  // 엑셀 불러오기
-  const handleImport = (e) => {
+  // 엑셀 불러오기 (bulk insert)
+  const handleImport = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = (evt) => {
+    reader.onload = async (evt) => {
       try {
         const data = new Uint8Array(evt.target.result);
         const wb = XLSX.read(data, { type: 'array' });
         const sheet = wb.Sheets[wb.SheetNames[0]];
         const rows = XLSX.utils.sheet_to_json(sheet);
-        const now = Date.now();
-        const imported = rows.map((row, idx) => ({
-          id: now + idx,
-          name: row['물품명'] || row['name'] || '',
-          category: row['분류'] || row['category'] || '',
-          quantity: Number(row['수량'] || row['quantity']) || 0,
-          status: row['상태'] || row['status'] || '사용가능',
-          location: row['위치'] || row['location'] || '',
-          note: row['비고'] || row['note'] || '',
-          photo: null,
-          repairs: [],
-          createdAt: new Date().toISOString(),
-        }));
-        const replace = confirm(
-          `${imported.length}개 항목을 불러왔습니다.\n\n[확인] 기존 데이터 교체\n[취소] 기존 목록에 추가`
-        );
-        if (replace) {
-          setItems(imported);
-        } else {
-          setItems((prev) => [...prev, ...imported]);
+        const imported = rows
+          .map((row) => ({
+            name: row['물품명'] || row['name'] || '',
+            category: row['분류'] || row['category'] || '',
+            quantity: Number(row['수량'] || row['quantity']) || 0,
+            status: row['상태'] || row['status'] || '사용가능',
+            location: row['위치'] || row['location'] || '',
+            note: row['비고'] || row['note'] || '',
+          }))
+          .filter((r) => r.name);
+
+        if (imported.length === 0) {
+          alert('가져올 데이터가 없습니다.');
+          return;
         }
+
+        const replace = confirm(
+          `${imported.length}개 항목을 불러왔습니다.\n\n[확인] 기존 데이터 전체 삭제 후 교체\n[취소] 기존 목록에 추가`
+        );
+
+        await runSafely(async () => {
+          if (replace) {
+            // 모든 사진 먼저 정리
+            for (const item of items) {
+              if (item.photo_url) await deletePhotoFromStorage(item.photo_url);
+              for (const r of item.repairs || []) {
+                if (r.photo_url) await deletePhotoFromStorage(r.photo_url);
+              }
+            }
+            const { error: delErr } = await supabase
+              .from('items')
+              .delete()
+              .not('id', 'is', null);
+            if (delErr) throw delErr;
+          }
+          const { error: insErr } = await supabase.from('items').insert(imported);
+          if (insErr) throw insErr;
+          await fetchItems();
+        }, '엑셀 불러오기 실패');
       } catch (err) {
-        alert('엑셀 파일을 읽는 중 오류가 발생했습니다.');
-        console.error(err);
+        alert('엑셀 파일을 읽는 중 오류가 발생했습니다: ' + err.message);
       }
     };
     reader.readAsArrayBuffer(file);
@@ -305,11 +440,13 @@ export default function App() {
 
   const filtered = items.filter((item) => {
     const matchSearch =
-      !search || item.name.toLowerCase().includes(search.toLowerCase());
+      !search || (item.name || '').toLowerCase().includes(search.toLowerCase());
     const matchCat = categoryFilter === '전체' || item.category === categoryFilter;
     const matchStatus = statusFilter === '전체' || item.status === statusFilter;
     return matchSearch && matchCat && matchStatus;
   });
+
+  if (!isSupabaseConfigured) return <SetupScreen />;
 
   return (
     <div className="app">
@@ -317,6 +454,14 @@ export default function App() {
         <h1>고령군청소년문화의집</h1>
         <p>물품기기 관리 시스템</p>
       </header>
+
+      {error && (
+        <div className="banner banner-error">
+          {error} <button onClick={() => setError(null)}>닫기</button>
+        </div>
+      )}
+
+      {busy && <div className="banner banner-info">처리 중...</div>}
 
       <section className="card">
         <h2>{editingId !== null ? '물품 수정' : '물품 등록'}</h2>
@@ -391,9 +536,9 @@ export default function App() {
 
           <div className="photo-section">
             <div className="photo-label">물품 사진</div>
-            {form.photo ? (
+            {form.photo_url ? (
               <div className="photo-preview">
-                <img src={form.photo} alt="미리보기" />
+                <img src={form.photo_url} alt="미리보기" />
                 <button
                   type="button"
                   className="btn-danger"
@@ -429,11 +574,11 @@ export default function App() {
 
           <div className="form-buttons">
             {editingId !== null && (
-              <button type="button" onClick={handleCancel}>
+              <button type="button" onClick={handleCancel} disabled={busy}>
                 취소
               </button>
             )}
-            <button type="submit" className="btn-primary">
+            <button type="submit" className="btn-primary" disabled={busy}>
               {editingId !== null ? '수정 완료' : '등록'}
             </button>
           </div>
@@ -487,18 +632,20 @@ export default function App() {
 
       <section className="card">
         <h2>물품 목록 ({filtered.length}개)</h2>
-        {filtered.length === 0 ? (
+        {loading ? (
+          <p className="empty">불러오는 중...</p>
+        ) : filtered.length === 0 ? (
           <p className="empty">등록된 물품이 없습니다.</p>
         ) : (
           <div className="items-grid">
             {filtered.map((item) => (
               <div key={item.id} className="item-card">
                 <div className="item-photo">
-                  {item.photo ? (
+                  {item.photo_url ? (
                     <img
-                      src={item.photo}
+                      src={item.photo_url}
                       alt={item.name}
-                      onClick={() => setPhotoPreview(item.photo)}
+                      onClick={() => setPhotoPreview(item.photo_url)}
                     />
                   ) : (
                     <div className="no-photo">사진 없음</div>
@@ -578,9 +725,9 @@ export default function App() {
 
               <div className="photo-section">
                 <div className="photo-label">수리 상황 사진</div>
-                {repairForm.photo ? (
+                {repairForm.photo_url ? (
                   <div className="photo-preview">
-                    <img src={repairForm.photo} alt="수리 사진" />
+                    <img src={repairForm.photo_url} alt="수리 사진" />
                     <button
                       type="button"
                       className="btn-danger"
@@ -614,7 +761,7 @@ export default function App() {
                 )}
               </div>
 
-              <button type="submit" className="btn-primary">
+              <button type="submit" className="btn-primary" disabled={busy}>
                 수리 기록 추가
               </button>
             </form>
@@ -641,11 +788,11 @@ export default function App() {
                         </button>
                       </div>
                       <p>{r.description}</p>
-                      {r.photo && (
+                      {r.photo_url && (
                         <img
-                          src={r.photo}
+                          src={r.photo_url}
                           alt="수리 사진"
-                          onClick={() => setPhotoPreview(r.photo)}
+                          onClick={() => setPhotoPreview(r.photo_url)}
                         />
                       )}
                     </div>
